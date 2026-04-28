@@ -1,9 +1,14 @@
 # MTD Champaign-Urbana Live Dashboard
 
-Static live dashboard for Champaign-Urbana MTD vehicle positions, optimized to keep live API usage low.
+Static CU-MTD dashboard inspired by Mini Metro, built to help riders understand crowding and make better boarding and deboarding decisions in real time.
 
 ## What it does
 
+- Uses a minimal, Mini Metro-inspired visual language to show the CU-MTD network as a live operational map
+- Tries to surface where congestion and rider pressure are building, especially around stops and route segments
+- Helps approximate the best place to get on and get off based on two rider priorities:
+  - `Comfort`: weighted toward easier boarding, better seat odds, and smoother exits
+  - `Convenience`: weighted toward directness, lower transfer count, and faster movement
 - Uses the current MTD developer API at `https://api.mtd.dev`
 - Uses a split local GTFS cache so the map boots from a small core payload and loads trip-stop detail lazily
 - Hits the live API only for `GET /vehicles/locations`
@@ -16,6 +21,17 @@ Static live dashboard for Champaign-Urbana MTD vehicle positions, optimized to k
 - Adds a fading pink/green occupancy-change overlay keyed to stops or nearby blocks
 - Includes a heatmap toggle and legend in the HUD
 - Supports dark and light themes
+
+## What it is trying to solve
+
+This project is aimed at a practical rider problem rather than only map visualization:
+
+- some stops are easier to board from than others at a given moment
+- some buses are more crowded before they reach you
+- some exits are easier than others depending on current stop pressure
+- the best ride is not always just the shortest one
+
+The planner and overlays try to approximate the best steps to board and deboard using live occupancy, stop pressure, route geometry, and low-transfer pathfinding. It is not claiming perfect trip planning accuracy; it is trying to make the rider’s next decision clearer.
 
 ## Local run
 
