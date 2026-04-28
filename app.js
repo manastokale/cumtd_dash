@@ -8,6 +8,15 @@
   const GTFS_RT_PROTO_URL = "./gtfs-realtime-vehicle.proto";
   const GTFS_RT_VEHICLE_POSITIONS_URL = "https://gtfs-rt.mtd.org/vehicle-positions";
   const DEFAULT_REFRESH_INTERVAL_MS = 120000;
+  const MIN_REFRESH_INTERVAL_MS = 1000;
+  const ANIMATION_INTERVAL_MULTIPLIER = 1.08;
+  const LINEAR_REALTIME_THRESHOLD_MS = 2500;
+  const PREDICTIVE_LOOKAHEAD_MAX_MS = 1400;
+  const PREDICTIVE_LOOKAHEAD_MIN_MS = 650;
+  const PREDICTIVE_LOOKAHEAD_RATIO = 0.7;
+  const PREDICTIVE_BLEND = 0.55;
+  const PREDICTIVE_MAX_LEAD_METERS = 42;
+  const REST_RATE_LIMIT_BACKOFF_MS = 15 * 60 * 1000;
   const LIVE_STALE_MAX_AGE_MS = 3 * 60 * 60 * 1000;
   const NETWORK_PAD_RATIO = 0.2;
   const ROUTE_CORRIDOR_MAX_METERS = 1100;
@@ -93,6 +102,9 @@
     previousTelemetryByVehicleId: new Map(),
     occupancyHeatByKey: new Map(),
     routeAnalyticsHistory: new Map(),
+    liveMotionPrimed: false,
+    restBackoffUntil: 0,
+    restBackoffReason: "",
     showOccupancyHeat: true,
     showBusBorders: false,
     showRouteBorders: false,
@@ -184,14 +196,17 @@
 
   async function init() {
     bindEvents();
-    showOverlay("Loading map", "Preparing basemap and route cache.");
-    updateStatus("Loading map", "Static cache");
+    showOverlay("Loading network", "Preparing basemap and route cache.");
+    updateStatus("Loading network", "Static cache");
 
     try {
       const [config, gtfs] = await Promise.all([loadRuntimeConfig(), loadGtfsCoreData()]);
       state.config = config;
       state.gtfs = gtfs;
-      state.refreshIntervalMs = Math.max(30000, Number(config.refreshIntervalMs) || DEFAULT_REFRESH_INTERVAL_MS);
+      state.refreshIntervalMs = Math.max(
+        MIN_REFRESH_INTERVAL_MS,
+        Number(config.refreshIntervalMs) || DEFAULT_REFRESH_INTERVAL_MS
+      );
       state.runtimeApiKey = usesDirectApi()
         ? config.apiKey || window.localStorage.getItem(STORAGE_KEYS.apiKey) || ""
         : "";
@@ -207,15 +222,18 @@
       await loadGtfsRealtimeProto();
       dom.apiKeyInput.value = state.runtimeApiKey;
       await initializeMap();
-      hideOverlay();
-      updateStatus("Map ready", "Click a route to isolate");
       window.setTimeout(() => {
         ensureTripStopsData().catch(() => { });
       }, 250);
 
-      if (canUseLiveRestApi()) {
-        startPolling(true);
+      if (canUseLiveFeeds()) {
+        await primeLiveMotion().catch(() => { });
+        showOverlay("Starting motion", "Live vehicles are ready.");
+        hideOverlay();
+        updateStatus("Map ready", "Click a route to isolate");
+        startPolling(false);
       } else {
+        hideOverlay();
         showOverlay("Awaiting API key", "Set API_KEY in .env or enter it here.");
         updateStatus("Awaiting API key", "Live feed disabled");
         openKeyPanel(true);
@@ -1412,10 +1430,10 @@
 
   function startPolling(immediate) {
     stopPolling();
-    if (!canUseLiveRestApi()) {
+    if (!canUseLiveFeeds()) {
       return;
     }
-    if (!state.vehicleMetaLoaded) {
+    if (!state.vehicleMetaLoaded && canUseRestApiNow()) {
       ensureVehicleMetadata().catch(() => { });
     }
     if (immediate) {
@@ -1432,8 +1450,11 @@
     }
   }
 
-  async function refreshVehicles(manual) {
-    if (!canUseLiveRestApi()) {
+  async function refreshVehicles(manual, options = {}) {
+    const suppressOverlayHide = Boolean(options.suppressOverlayHide);
+    const scheduleNext = options.scheduleNext !== false;
+    const throwOnError = Boolean(options.throwOnError);
+    if (!canUseLiveFeeds()) {
       return;
     }
     if (document.visibilityState !== "visible" && !manual) {
@@ -1447,22 +1468,40 @@
     state.refreshing = true;
     stopPolling();
     dom.refreshButton.disabled = true;
+    const refreshStartedAt = performance.now();
 
     try {
-      const [payload, vehiclePositions] = await Promise.all([
-        fetchLive("/vehicles/locations"),
+      const restFetch = canUseRestApiNow() ? fetchLive("/vehicles/locations") : Promise.resolve(null);
+      const [restOutcome, vehiclePositions] = await Promise.all([
+        restFetch.then((value) => ({ ok: true, value })).catch((error) => ({ ok: false, error })),
         fetchGtfsRtVehiclePositions(),
       ]);
       state.vehiclePositionsById = vehiclePositions;
-      const vehicles = (Array.isArray(payload) ? payload : [])
-        .map(normalizeVehicle)
-        .filter((vehicle) => vehicle.location && vehicle.tripId && vehicle.route?.gtfsRouteId)
-        .map(resolveVehicle)
-        .map(attachVehiclePosition)
-        .filter((vehicle) => vehicle.shapeId && state.gtfs.shapes?.[vehicle.shapeId])
-        .filter((vehicle) => withinNetworkBounds(vehicle.location))
-        .filter((vehicle) => withinRouteCorridor(vehicle))
-        .filter(isFreshVehicle);
+      let restError = null;
+      let restVehicles = [];
+      if (restOutcome.ok) {
+        restVehicles = (Array.isArray(restOutcome.value) ? restOutcome.value : [])
+          .map(normalizeVehicle)
+          .filter((vehicle) => vehicle.location && vehicle.tripId && vehicle.route?.gtfsRouteId)
+          .map(resolveVehicle)
+          .map(attachVehiclePosition)
+          .filter((vehicle) => vehicle.shapeId && state.gtfs.shapes?.[vehicle.shapeId])
+          .filter((vehicle) => withinNetworkBounds(vehicle.location))
+          .filter((vehicle) => withinRouteCorridor(vehicle))
+          .filter(isFreshVehicle);
+      } else {
+        restError = restOutcome.error;
+        handleRestApiError(restError);
+      }
+
+      let vehicles = restVehicles;
+      if (!vehicles.length && vehiclePositions.size) {
+        vehicles = buildVehiclesFromGtfsRt(vehiclePositions);
+      }
+
+      if (!vehicles.length && restError) {
+        throw restError;
+      }
       const enrichedVehicles = attachDerivedTelemetry(vehicles);
 
       state.liveVehicles = enrichedVehicles;
@@ -1480,30 +1519,63 @@
         queuePlannerComputation();
       }
       refreshOpenBusPanel(false);
-      hideOverlay();
+      if (!suppressOverlayHide) {
+        hideOverlay();
+      }
 
       if (!state.selectedRouteId) {
-        updateStatus(
-          `${state.busMarkers.size} buses`,
-          `${state.activeRouteCount} live lines • ${state.lastUpdatedLabel}`
-        );
+        const detail = restError
+          ? `${state.activeRouteCount} live lines • GTFS-RT fallback • ${state.lastUpdatedLabel}`
+          : `${state.activeRouteCount} live lines • ${state.lastUpdatedLabel}`;
+        updateStatus(`${state.busMarkers.size} buses`, detail);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to refresh vehicles.";
-      updateStatus("Live request failed", "Check API key or network");
+      updateStatus("Live request failed", state.restBackoffUntil > Date.now() ? "REST feed paused" : "Check API key or network");
       if (!state.busMarkers.size) {
         showOverlay("Live request failed", message);
+      }
+      if (throwOnError) {
+        throw error instanceof Error ? error : new Error(message);
       }
     } finally {
       state.refreshing = false;
       dom.refreshButton.disabled = false;
       if (state.queuedRefresh) {
         state.queuedRefresh = false;
-        refreshVehicles(manual);
-      } else if (document.visibilityState === "visible") {
-        state.refreshTimer = window.setTimeout(() => refreshVehicles(false), state.refreshIntervalMs);
+        refreshVehicles(manual, options);
+      } else if (scheduleNext && document.visibilityState === "visible") {
+        const elapsed = performance.now() - refreshStartedAt;
+        const nextDelay = Math.max(0, state.refreshIntervalMs - elapsed);
+        state.refreshTimer = window.setTimeout(() => refreshVehicles(false), nextDelay);
       }
     }
+  }
+
+  async function primeLiveMotion() {
+    showOverlay("Syncing live vehicles", "Capturing first snapshot.");
+    updateStatus("Syncing live vehicles", "First live sample");
+    await refreshVehicles(true, {
+      suppressOverlayHide: true,
+      scheduleNext: false,
+      throwOnError: true,
+    });
+
+    const warmupDelay = clamp(state.refreshIntervalMs, 900, 2500);
+    if (state.busMarkers.size > 0) {
+      showOverlay("Starting motion", "Capturing second snapshot for smooth movement.");
+      updateStatus("Starting motion", "Second live sample");
+      await wait(warmupDelay);
+      await refreshVehicles(true, {
+        suppressOverlayHide: true,
+        scheduleNext: false,
+        throwOnError: true,
+      });
+      state.liveMotionPrimed = true;
+      return;
+    }
+
+    state.liveMotionPrimed = false;
   }
 
   async function fetchLive(path) {
@@ -1513,9 +1585,14 @@
     if (usesDirectApi() && state.runtimeApiKey) {
       headers["X-ApiKey"] = state.runtimeApiKey;
     }
-    const response = await fetch(`${resolveApiBase()}${path}`, {
-      headers,
-    });
+    let response;
+    try {
+      response = await fetch(`${resolveApiBase()}${path}`, {
+        headers,
+      });
+    } catch (error) {
+      throw new Error(describeLiveFetchFailure(error));
+    }
     const payload = await response.json().catch(() => ({}));
     const result = payload?.result ?? payload?.Result ?? payload;
     const errorMessage =
@@ -1525,7 +1602,15 @@
       payload?.message ??
       "";
     if (!response.ok) {
-      throw new Error(errorMessage || `HTTP ${response.status}`);
+      const error = new Error(errorMessage || `HTTP ${response.status}`);
+      error.status = response.status;
+      error.retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+      if (!errorMessage && response.status === 404 && !usesDirectApi()) {
+        throw new Error(
+          "Proxy route not found. Run `scripts/start_local_proxy.sh` for proxy mode, or switch `.env` to `API_MODE=direct` and use `scripts/start_local_direct.sh`."
+        );
+      }
+      throw error;
     }
     return result;
   }
@@ -1573,6 +1658,7 @@
     for (const entity of Array.isArray(entities) ? entities : []) {
       const vehicle = entity?.vehicle;
       const vehicleId = String(vehicle?.vehicle?.id || vehicle?.vehicle?.label || "").trim();
+      const location = extractLocation(vehicle?.position || null);
       if (!vehicleId) {
         continue;
       }
@@ -1580,6 +1666,7 @@
         vehicleId,
         tripId: String(vehicle?.trip?.tripId || "").trim(),
         routeId: String(vehicle?.trip?.routeId || "").trim(),
+        location,
         stopId: String(vehicle?.stopId || "").trim(),
         currentStopSequence: Number(vehicle?.currentStopSequence || 0) || 0,
         currentStatus: String(vehicle?.currentStatus || "").trim(),
@@ -1591,6 +1678,48 @@
       });
     }
     return result;
+  }
+
+  function buildVehiclesFromGtfsRt(vehiclePositions) {
+    const vehicles = [];
+    for (const vehiclePosition of vehiclePositions.values()) {
+      const tripId = String(vehiclePosition?.tripId || "").trim();
+      const routeId = String(vehiclePosition?.routeId || "").trim();
+      const location = Array.isArray(vehiclePosition?.location) ? vehiclePosition.location : null;
+      if (!tripId || !routeId || !location) {
+        continue;
+      }
+      const routeMeta = state.gtfs.routesByGtfsRouteId?.[routeId] || null;
+      const shapeId = state.gtfs.tripShapeIndex?.[tripId] || "";
+      if (!shapeId || !state.gtfs.shapes?.[shapeId]) {
+        continue;
+      }
+      const updatedAt = Number(vehiclePosition?.timestamp || 0) > 0
+        ? new Date(Number(vehiclePosition.timestamp) * 1000).toISOString()
+        : "";
+      vehicles.push({
+        id: String(vehiclePosition.vehicleId || "").trim(),
+        tripId,
+        route: {
+          id: routeMeta?.gtfsRouteId || routeId,
+          gtfsRouteId: routeMeta?.gtfsRouteId || routeId,
+          shortName: routeMeta?.shortName || routeId,
+          longName: routeMeta?.longName || "",
+          color: routeMeta?.color || "#d9d1c3",
+          textColor: routeMeta?.textColor || "#ffffff",
+        },
+        location,
+        updatedAt,
+        headsign: "",
+        direction: null,
+        shapeId,
+        vehiclePosition,
+      });
+    }
+    return vehicles
+      .filter((vehicle) => withinNetworkBounds(vehicle.location))
+      .filter((vehicle) => withinRouteCorridor(vehicle))
+      .filter(isFreshVehicle);
   }
 
   function normalizeDirection(raw) {
@@ -1654,9 +1783,17 @@
   }
 
   function attachVehiclePosition(vehicle) {
+    const vehiclePosition = state.vehiclePositionsById.get(vehicle.id) || null;
+    const liveLocation = Array.isArray(vehiclePosition?.location) ? vehiclePosition.location : vehicle.location;
+    const liveUpdatedAt = Number(vehiclePosition?.timestamp || 0) > 0
+      ? new Date(Number(vehiclePosition.timestamp) * 1000).toISOString()
+      : vehicle.updatedAt;
     return {
       ...vehicle,
-      vehiclePosition: state.vehiclePositionsById.get(vehicle.id) || null,
+      vehiclePosition,
+      apiLocation: vehicle.location,
+      location: liveLocation,
+      updatedAt: liveUpdatedAt,
     };
   }
 
@@ -1670,9 +1807,12 @@
       const rawLocation = vehicle.location;
       const derivedSpeedMph = deriveVehicleSpeedMph(vehicle, previous, currentTimestamp);
       const snapped = snapLocationToShape(rawLocation, vehicle.shapeId);
+      const display = projectDisplayPosition(vehicle, snapped, previous, currentTimestamp, derivedSpeedMph);
       nextTelemetryByVehicleId.set(vehicle.id, {
         location: rawLocation,
         timestamp: currentTimestamp,
+        shapeId: vehicle.shapeId,
+        progress: snapped.progress,
       });
       return {
         ...vehicle,
@@ -1680,6 +1820,9 @@
         location: snapped.location,
         snapDistanceMeters: snapped.distance,
         shapeProgress: snapped.progress,
+        displayLocation: display.location,
+        displayProgress: display.progress,
+        displayAngle: display.angle,
         derivedSpeedMph,
       };
     });
@@ -1744,18 +1887,23 @@
 
     for (const vehicle of vehicles) {
       const existing = state.busMarkers.get(vehicle.id);
+      const displayLocation = vehicle.displayLocation || vehicle.location;
+      const displayProgress = Number.isFinite(vehicle.displayProgress) ? vehicle.displayProgress : vehicle.shapeProgress;
+      const displayAngle = Number.isFinite(vehicle.displayAngle)
+        ? vehicle.displayAngle
+        : inferVehicleAngleAtProgress(vehicle.shapeId, displayProgress);
       if (!existing) {
         const marker = createBusMarker(vehicle);
         state.busMarkers.set(vehicle.id, {
           marker,
-          current: vehicle.location,
-          previous: vehicle.location,
-          target: vehicle.location,
-          currentProgress: vehicle.shapeProgress,
-          previousProgress: vehicle.shapeProgress,
-          targetProgress: vehicle.shapeProgress,
+          current: displayLocation,
+          previous: displayLocation,
+          target: displayLocation,
+          currentProgress: displayProgress,
+          previousProgress: displayProgress,
+          targetProgress: displayProgress,
           shapeId: vehicle.shapeId,
-          angle: inferVehicleAngleAtProgress(vehicle.shapeId, vehicle.shapeProgress),
+          angle: displayAngle,
           routeId: vehicle.route.gtfsRouteId,
           vehicle,
         });
@@ -1763,20 +1911,20 @@
       } else {
         const shapeChanged = existing.shapeId !== vehicle.shapeId;
         existing.previous = existing.current;
-        existing.previousProgress = shapeChanged ? vehicle.shapeProgress : existing.currentProgress;
-        existing.target = vehicle.location;
-        existing.targetProgress = vehicle.shapeProgress;
+        existing.previousProgress = shapeChanged ? displayProgress : existing.currentProgress;
+        existing.target = displayLocation;
+        existing.targetProgress = displayProgress;
         existing.shapeId = vehicle.shapeId;
         existing.routeId = vehicle.route.gtfsRouteId;
-        existing.angle = inferVehicleAngleAtProgress(vehicle.shapeId, vehicle.shapeProgress);
+        existing.angle = displayAngle;
         existing.vehicle = vehicle;
         if (shapeChanged) {
-          existing.previous = vehicle.location;
-          existing.current = vehicle.location;
-          existing.target = vehicle.location;
-          existing.previousProgress = vehicle.shapeProgress;
-          existing.currentProgress = vehicle.shapeProgress;
-          existing.targetProgress = vehicle.shapeProgress;
+          existing.previous = displayLocation;
+          existing.current = displayLocation;
+          existing.target = displayLocation;
+          existing.previousProgress = displayProgress;
+          existing.currentProgress = displayProgress;
+          existing.targetProgress = displayProgress;
         }
       }
     }
@@ -2013,11 +2161,11 @@
       window.cancelAnimationFrame(state.animationFrame);
     }
     const start = performance.now();
-    const duration = Math.max(900, state.refreshIntervalMs * 0.88);
+    const duration = Math.max(950, state.refreshIntervalMs * ANIMATION_INTERVAL_MULTIPLIER);
 
     const tick = (now) => {
       const progress = Math.min(1, (now - start) / duration);
-      const eased = easeInOut(progress);
+      const eased = state.refreshIntervalMs <= LINEAR_REALTIME_THRESHOLD_MS ? progress : easeInOut(progress);
 
       for (const markerState of state.busMarkers.values()) {
         const animated = interpolateMarkerState(markerState, eased);
@@ -2102,6 +2250,107 @@
       progress: markerState.targetProgress,
       angle: markerState.angle,
     };
+  }
+
+  function projectDisplayPosition(vehicle, snapped, previous, currentTimestamp, derivedSpeedMph) {
+    const baseProgress = Number(snapped?.progress);
+    const baseLocation = Array.isArray(snapped?.location) ? snapped.location : vehicle.location;
+    const baseAngle = inferVehicleAngleAtProgress(vehicle.shapeId, baseProgress);
+    if (!Number.isFinite(baseProgress) || !Array.isArray(baseLocation)) {
+      return {
+        progress: baseProgress,
+        location: baseLocation,
+        angle: baseAngle,
+      };
+    }
+    if (!previous || previous.shapeId !== vehicle.shapeId || !Number.isFinite(previous.progress)) {
+      return {
+        progress: baseProgress,
+        location: baseLocation,
+        angle: baseAngle,
+      };
+    }
+
+    const deltaMs = currentTimestamp - Number(previous.timestamp || 0);
+    if (!Number.isFinite(deltaMs) || deltaMs < 400 || deltaMs > 12000) {
+      return {
+        progress: baseProgress,
+        location: baseLocation,
+        angle: baseAngle,
+      };
+    }
+
+    const progressDelta = baseProgress - previous.progress;
+    const seconds = deltaMs / 1000;
+    let speedMps = progressDelta / seconds;
+    const derivedSpeedMps = Number.isFinite(derivedSpeedMph) ? derivedSpeedMph / 2.23694 : NaN;
+    const bearing = Number(vehicle?.vehiclePosition?.bearing);
+    const bearingFactor = predictiveBearingFactor(baseAngle, bearing);
+
+    if (!Number.isFinite(speedMps) || speedMps < 0) {
+      speedMps = derivedSpeedMps;
+    } else if (Number.isFinite(derivedSpeedMps)) {
+      speedMps = Math.min(Math.max(speedMps, 0), Math.max(derivedSpeedMps * 1.2, 1));
+    }
+
+    if (!Number.isFinite(speedMps) || speedMps < 1.2) {
+      return {
+        progress: baseProgress,
+        location: baseLocation,
+        angle: baseAngle,
+      };
+    }
+
+    const lookaheadMs = clamp(
+      state.refreshIntervalMs * PREDICTIVE_LOOKAHEAD_RATIO,
+      PREDICTIVE_LOOKAHEAD_MIN_MS,
+      PREDICTIVE_LOOKAHEAD_MAX_MS
+    );
+    const leadMeters = Math.min(
+      PREDICTIVE_MAX_LEAD_METERS,
+      speedMps * bearingFactor * (lookaheadMs / 1000)
+    );
+    if (!Number.isFinite(leadMeters) || leadMeters <= 1) {
+      return {
+        progress: baseProgress,
+        location: baseLocation,
+        angle: baseAngle,
+      };
+    }
+
+    const projectedProgress = baseProgress + leadMeters;
+    const displayProgress = lerp(baseProgress, projectedProgress, PREDICTIVE_BLEND);
+    const sample = sampleShapeAtProgress(vehicle.shapeId, displayProgress);
+    if (!Array.isArray(sample.location)) {
+      return {
+        progress: baseProgress,
+        location: baseLocation,
+        angle: baseAngle,
+      };
+    }
+
+    return {
+      progress: displayProgress,
+      location: sample.location,
+      angle: sample.angle,
+    };
+  }
+
+  function predictiveBearingFactor(routeAngle, bearing) {
+    if (!Number.isFinite(bearing) || !Number.isFinite(routeAngle)) {
+      return 1;
+    }
+    const delta = angleDeltaDegrees(routeAngle, bearing);
+    if (delta >= 120) {
+      return 0.15;
+    }
+    if (delta >= 90) {
+      return 0.35;
+    }
+    if (delta >= 55) {
+      return 0.65;
+    }
+    return 1;
   }
 
   function inferVehicleAngleAtProgress(shapeId, progress) {
@@ -2229,11 +2478,11 @@
       await ensureVehicleMetadata();
       const localDetail = deriveTripDetail(markerState.vehicle);
       const [trip, stop, departure] = await Promise.all([
-        canUseLiveRestApi() ? fetchTripDetail(markerState.vehicle.tripId) : Promise.resolve(null),
-        canUseLiveRestApi() && localDetail.nextStop?.stopId
+        canUseRestApiNow() ? fetchTripDetail(markerState.vehicle.tripId) : Promise.resolve(null),
+        canUseRestApiNow() && localDetail.nextStop?.stopId
           ? fetchStopDetail(localDetail.nextStop.stopId)
           : Promise.resolve(null),
-        canUseLiveRestApi() && localDetail.nextStop?.stopId
+        canUseRestApiNow() && localDetail.nextStop?.stopId
           ? fetchNextStopDeparture(markerState.vehicle, localDetail.nextStop.stopId).catch(() => null)
           : Promise.resolve(null),
       ]);
@@ -2362,7 +2611,7 @@
   }
 
   async function ensureVehicleMetadata() {
-    if (state.vehicleMetaLoaded || !canUseLiveRestApi()) {
+    if (state.vehicleMetaLoaded || !canUseRestApiNow()) {
       return;
     }
     const vehicles = await fetchLive("/vehicles");
@@ -2380,6 +2629,9 @@
   }
 
   async function fetchNextStopDeparture(vehicle, stopId) {
+    if (!canUseRestApiNow()) {
+      return null;
+    }
     const departures = await fetchLive(`/stops/${encodeURIComponent(stopId)}/departures?time=90`);
     const list = Array.isArray(departures) ? departures : [];
     const exactMatch = list.find((departure) => {
@@ -2408,14 +2660,14 @@
   }
 
   async function fetchTripDetail(tripId) {
-    if (!tripId) {
+    if (!tripId || !canUseRestApiNow()) {
       return null;
     }
     return fetchLive(`/trips/${encodeURIComponent(tripId)}`);
   }
 
   async function fetchStopDetail(stopId) {
-    if (!stopId) {
+    if (!stopId || !canUseRestApiNow()) {
       return null;
     }
     return fetchLive(`/stops/${encodeURIComponent(stopId)}`);
@@ -5150,16 +5402,70 @@
     return String(state.config?.apiMode || DEFAULT_CONFIG.apiMode).trim().toLowerCase() === "direct";
   }
 
-  function canUseLiveRestApi() {
+  function canUseLiveFeeds() {
+    return canUseRestApiConfigured() || Boolean(state.gtfsRtFeedType);
+  }
+
+  function canUseRestApiConfigured() {
     return usesDirectApi() ? Boolean(state.runtimeApiKey) : Boolean(resolveApiBase());
+  }
+
+  function canUseLiveRestApi() {
+    return canUseRestApiConfigured();
+  }
+
+  function canUseRestApiNow() {
+    return canUseRestApiConfigured() && Date.now() >= state.restBackoffUntil;
   }
 
   function resolveApiBase() {
     const configured = String(state.config?.apiBase || "").trim();
+    if (usesDirectApi()) {
+      if (/^https?:\/\//i.test(configured)) {
+        return configured.replace(/\/+$/, "");
+      }
+      return API_BASE;
+    }
     if (configured) {
       return configured.replace(/\/+$/, "");
     }
-    return usesDirectApi() ? API_BASE : "/api";
+    return "/api";
+  }
+
+  function describeLiveFetchFailure(error) {
+    const baseMessage = error instanceof Error ? error.message : "Load failed";
+    if (!usesDirectApi()) {
+      return `${baseMessage}. Proxy mode needs Cloudflare Pages Functions. Run \`scripts/start_local_proxy.sh\` locally, or switch to direct mode in \`.env\` and run \`scripts/start_local_direct.sh\`.`;
+    }
+    return `${baseMessage}. Direct mode needs a valid \`API_KEY\` in \`.env\` and a static server started with \`scripts/start_local_direct.sh\`.`;
+  }
+
+  function handleRestApiError(error) {
+    const status = Number(error?.status || 0);
+    const message = String(error?.message || "");
+    if (status === 429 || /rate limit|too many requests/i.test(message)) {
+      const retryAfterMs = Number(error?.retryAfterMs || 0);
+      const backoffMs = retryAfterMs > 0 ? retryAfterMs : REST_RATE_LIMIT_BACKOFF_MS;
+      state.restBackoffUntil = Date.now() + backoffMs;
+      state.restBackoffReason = message || "Rate limit reached";
+      updateStatus("REST feed paused", "Using GTFS-RT fallback");
+    }
+  }
+
+  function parseRetryAfterMs(value) {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return 0;
+    }
+    const seconds = Number.parseInt(raw, 10);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return seconds * 1000;
+    }
+    const absolute = new Date(raw).getTime();
+    if (!Number.isFinite(absolute)) {
+      return 0;
+    }
+    return Math.max(0, absolute - Date.now());
   }
 
   function syncBusMarkerLabelRotation(element, angle) {
@@ -5348,6 +5654,16 @@
     return start + (end - start) * amount;
   }
 
+  function angleDeltaDegrees(left, right) {
+    const a = Number(left);
+    const b = Number(right);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) {
+      return 180;
+    }
+    const delta = ((a - b + 540) % 360) - 180;
+    return Math.abs(delta);
+  }
+
   function interpolateLinear(value, stops) {
     if (!Array.isArray(stops) || stops.length < 4) {
       return 1;
@@ -5374,6 +5690,10 @@
 
   function easeInOut(value) {
     return value < 0.5 ? 4 * value * value * value : 1 - Math.pow(-2 * value + 2, 3) / 2;
+  }
+
+  function wait(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   function easeOutCubic(value) {

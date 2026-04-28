@@ -73,7 +73,11 @@ This repo now supports a same-origin `/api/*` proxy through Cloudflare Pages Fun
 
 1. Push this repo to GitHub.
 2. Create a Cloudflare Pages project connected to the repo.
-3. Use the repo root as the build output directory.
+3. Use these Pages build settings:
+   - Framework preset: `None`
+   - Build command: leave blank
+   - Build output directory: `.`
+   - Root directory: `/`
 4. In Cloudflare Pages, set this secret:
    - `API_KEY`
 5. Optional Pages variables:
@@ -88,6 +92,11 @@ This repo now supports a same-origin `/api/*` proxy through Cloudflare Pages Fun
 Recommended Cloudflare runtime config:
 - `API_MODE=proxy`
 - `API_BASE=/api`
+
+Important:
+- Do **not** set the deploy command to `npx wrangler deploy` for a Git-connected Pages project.
+- Pages will pick up the `functions/` directory automatically during the normal Pages build/deploy flow.
+- If you want to deploy manually with Wrangler from your machine, use `npx wrangler pages deploy .`, not `npx wrangler deploy`.
 
 The proxy allowlists only these REST paths:
 - `/vehicles/locations`

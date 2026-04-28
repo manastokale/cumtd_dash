@@ -178,7 +178,8 @@ def normalize_color(value: str) -> str:
 def write_runtime_config() -> None:
     env = read_env_file(Path(".env"))
     api_mode = (env.get("API_MODE", "proxy") or "proxy").strip().lower()
-    api_base = env.get("API_BASE", "/api").strip() or "/api"
+    api_base_default = "/api" if api_mode != "direct" else ""
+    api_base = env.get("API_BASE", api_base_default).strip()
     config = {
         "apiKey": env.get("API_KEY", "") if api_mode == "direct" else "",
         "apiMode": api_mode,

@@ -1,0 +1,5 @@
+API_KEY=your_mtd_key_here
+API_MODE=proxy
+API_BASE=/api
+REFRESH_INTERVAL_MS=1000
+INITIAL_THEME=light

@@ -1,7 +1,7 @@
 const API_ORIGIN = "https://api.mtd.dev";
 
 const CACHE_TTLS = [
-  { pattern: /^\/vehicles\/locations$/, ttl: 15 },
+  { pattern: /^\/vehicles\/locations$/, ttl: 1 },
   { pattern: /^\/vehicles$/, ttl: 3600 },
   { pattern: /^\/trips\/[^/]+$/, ttl: 21600 },
   { pattern: /^\/stops\/[^/]+$/, ttl: 21600 },
