@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f1efe6">
+    <title>MTD Champaign-Urbana Live Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,500,0,0" rel="stylesheet">
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.css"
+      crossorigin="anonymous"
+    >
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <div id="map" class="map-shell" aria-label="MTD map"></div>
+
+      <div class="hud hud-left" aria-live="polite">
+        <span id="status-primary">Loading map</span>
+        <span id="status-secondary">Static cache</span>
+      </div>
+
+      <div class="hud hud-planner" aria-label="Region directions">
+        <button class="text-button planner-action-button" id="planner-from-button" type="button">
+          <span class="material-symbols-rounded" aria-hidden="true">trip_origin</span>
+          <span>From</span>
+        </button>
+        <button class="text-button planner-action-button" id="planner-to-button" type="button">
+          <span class="material-symbols-rounded" aria-hidden="true">place</span>
+          <span>To</span>
+        </button>
+        <button class="text-button planner-action-button ghost" id="planner-clear-button" type="button">
+          <span class="material-symbols-rounded" aria-hidden="true">backspace</span>
+          <span>Clear</span>
+        </button>
+        <button class="text-button planner-action-button" id="planner-mode-sitting" type="button">
+          <span class="material-symbols-rounded" aria-hidden="true">event_seat</span>
+          <span>Comfort</span>
+        </button>
+        <button class="text-button planner-action-button" id="planner-mode-standing" type="button">
+          <span class="material-symbols-rounded" aria-hidden="true">bolt</span>
+          <span>Convenience</span>
+        </button>
+        <span class="planner-hint" id="planner-hint">Drag a region after choosing From or To</span>
+      </div>
+
+      <div class="hud hud-legend" aria-label="Occupancy heatmap controls">
+        <button class="text-button heat-toggle-button" id="heat-toggle-button" type="button"><span class="material-symbols-rounded" aria-hidden="true">fluid</span><span>Heat On</span></button>
+        <div class="heat-legend-items">
+          <span class="heat-legend-item"><span class="heat-swatch heat-swatch-pink"></span><span class="material-symbols-rounded" aria-hidden="true">warning</span><span>Pressure</span></span>
+          <span class="heat-legend-item"><span class="heat-swatch heat-swatch-green"></span><span class="material-symbols-rounded" aria-hidden="true">eco</span><span>Relief</span></span>
+        </div>
+      </div>
+
+      <div class="hud hud-right">
+        <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh live vehicles">
+          <span class="material-symbols-rounded" aria-hidden="true">sync</span>
+        </button>
+        <button class="icon-button" id="theme-toggle" type="button" aria-label="Toggle theme">
+          <span class="material-symbols-rounded" aria-hidden="true">contrast</span>
+        </button>
+        <button class="icon-button" id="info-toggle" type="button" aria-label="About this dashboard" aria-pressed="false">
+          <span class="material-symbols-rounded" aria-hidden="true">info</span>
+        </button>
+        <button class="icon-button" id="route-legend-toggle" type="button" aria-label="Route legend" aria-pressed="false">
+          <span class="material-symbols-rounded" aria-hidden="true">route</span>
+        </button>
+      </div>
+
+      <div class="hud hud-zoom" aria-label="Map zoom controls">
+        <button class="icon-button" id="zoom-in-button" type="button" aria-label="Zoom in">
+          <span class="material-symbols-rounded" aria-hidden="true">add</span>
+        </button>
+        <input
+          id="zoom-slider"
+          class="zoom-slider"
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value="0"
+          aria-label="Zoom level"
+        >
+        <button class="icon-button" id="zoom-out-button" type="button" aria-label="Zoom out">
+          <span class="material-symbols-rounded" aria-hidden="true">remove</span>
+        </button>
+      </div>
+
+      <aside class="info-panel" id="info-panel" hidden aria-live="polite">
+        <p class="info-panel-kicker">About</p>
+        <p class="info-panel-copy">This dashboard helps riders and planners see where CU-MTD buses are, how crowded they look, and where boarding pressure is building.</p>
+        <p class="info-panel-copy">Use routes, buses, or stops for live operational insight.</p>
+        <p class="info-panel-copy">Use From and To to select two stop regions, then switch between Comfort and Convenience to compare the best low-transfer ride.</p>
+        <div class="info-panel-toggles">
+          <button class="info-toggle-row" id="bus-border-toggle" type="button" aria-pressed="false">
+            <span class="info-toggle-copy">Bus borders</span>
+            <span class="info-toggle-pill">Off</span>
+          </button>
+          <button class="info-toggle-row" id="route-border-toggle" type="button" aria-pressed="false">
+            <span class="info-toggle-copy">Route borders</span>
+            <span class="info-toggle-pill">Off</span>
+          </button>
+        </div>
+      </aside>
+
+      <aside class="route-legend-panel" id="route-legend-panel" hidden aria-live="polite">
+        <p class="route-legend-kicker">Lines</p>
+        <div class="route-legend-list" id="route-legend-list"></div>
+      </aside>
+
+      <section class="key-panel" id="key-panel" hidden>
+        <label class="sr-only" for="api-key-input">MTD API key</label>
+        <input
+          id="api-key-input"
+          type="password"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="MTD X-ApiKey"
+        >
+        <div class="key-actions">
+          <button class="text-button" id="save-key" type="button">Save</button>
+          <button class="text-button ghost" id="clear-key" type="button">Clear</button>
+          <button class="text-button ghost" id="toggle-key-panel" type="button">Close</button>
+        </div>
+      </section>
+
+      <aside class="bus-panel" id="bus-panel" hidden aria-live="polite">
+        <div class="bus-panel-card">
+          <section class="bus-pane bus-pane-left">
+            <div class="bus-panel-header">
+              <div>
+                <p class="bus-panel-kicker" id="bus-panel-kicker">Live bus</p>
+                <h2 class="bus-panel-title" id="bus-panel-title">Vehicle</h2>
+              </div>
+            </div>
+            <div class="bus-panel-meta-card" id="bus-panel-meta-card">
+              <p class="bus-panel-section-label" id="bus-panel-meta-label">Live profile</p>
+              <div class="bus-panel-meta" id="bus-panel-meta"></div>
+              <div class="bus-panel-meta-extra" id="bus-panel-meta-extra"></div>
+            </div>
+            <div class="bus-panel-spotlight" id="bus-panel-spotlight-left" hidden></div>
+            <div class="bus-panel-grid" id="bus-panel-grid-left"></div>
+          </section>
+          <section class="bus-pane bus-pane-right">
+            <div class="bus-panel-upcoming">
+              <div class="bus-panel-spotlight" id="bus-panel-spotlight-right" hidden></div>
+              <p class="bus-panel-section-label" id="bus-panel-list-label">Upcoming stops</p>
+              <div class="bus-stop-list" id="bus-stop-list"></div>
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <div class="overlay" id="overlay" aria-live="polite">
+        <div class="overlay-card">
+          <p id="overlay-primary">Loading map</p>
+          <p id="overlay-secondary">Preparing tiles and routes.</p>
+        </div>
+      </div>
+
+      <div class="planner-selection-box" id="planner-selection-box" hidden aria-hidden="true"></div>
+    </main>
+
+    <script
+      src="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.js"
+      crossorigin="anonymous"
+    ></script>
+    <script
+      src="https://unpkg.com/protobufjs@7.4.0/dist/protobuf.min.js"
+      crossorigin="anonymous"
+    ></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
