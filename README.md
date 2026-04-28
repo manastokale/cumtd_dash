@@ -9,6 +9,9 @@ Static CU-MTD dashboard inspired by Mini Metro, built to help riders understand 
 - Helps approximate the best place to get on and get off based on two rider priorities:
   - `Comfort`: weighted toward easier boarding, better seat odds, and smoother exits
   - `Convenience`: weighted toward directness, lower transfer count, and faster movement
+
+![Map feature](./assets/approximate_comfort_directions.png)
+
 - Uses the current MTD developer API at `https://api.mtd.dev`
 - Uses a split local GTFS cache so the map boots from a small core payload and loads trip-stop detail lazily
 - Hits the live API only for `GET /vehicles/locations`
@@ -17,8 +20,11 @@ Static CU-MTD dashboard inspired by Mini Metro, built to help riders understand 
 - Stores your `X-ApiKey` only in local browser storage
 - Renders a MapLibre-powered live tiled basemap with a minimal Mini Metro-inspired route overlay
 - Click a bus to open a compact vehicle profile with live occupancy/congestion and upcoming stops
+![Bus View Focus](./assets/focus_bus.png)
 - Click a route to open a route analysis panel with active fleet and occupancy-pressure insights
+![Route View Focus](./assets/focus_route.png)
 - Adds a fading pink/green occupancy-change overlay keyed to stops or nearby blocks
+![Traffic Heat Map](./assets/heatmap.png)
 - Includes a heatmap toggle and legend in the HUD
 - Supports dark and light themes
 
@@ -32,6 +38,8 @@ This project is aimed at a practical rider problem rather than only map visualiz
 - the best ride is not always just the shortest one
 
 The planner and overlays try to approximate the best steps to board and deboard using live occupancy, stop pressure, route geometry, and low-transfer pathfinding. It is not claiming perfect trip planning accuracy; it is trying to make the rider’s next decision clearer.
+
+![Stop View Focus](./assets/focus_stop.png)
 
 ## Local run
 
