@@ -76,24 +76,5 @@ python3 -m http.server 8000
 - `TILE_MAX_ZOOM`: optional tile max zoom
 - `INITIAL_THEME`: `light` or `dark`
 
-## GitHub Pages deploy
-
-The Pages workflow now generates `data/runtime-config.json` during the GitHub Actions build, so you do not need to commit that file.
-
-Set these in your GitHub repo before pushing:
-
-- Secret: `API_KEY`
-- Optional repository variables:
-  - `REFRESH_INTERVAL_MS`
-  - `TILE_URL`
-  - `TILE_ATTRIBUTION`
-  - `TILE_MAX_ZOOM`
-  - `INITIAL_THEME`
-
-Important:
-
-- This still exposes the MTD key in the final deployed static site, because the browser receives `data/runtime-config.json`.
-- The secret stays hidden in Actions logs and repo settings, but not in the built Pages artifact.
-
 # I KNOW MY API KEY IS PUBLIC, IT'S THERE ON PURPOSE!!!
 # I JUST NEEDED TO GET A POC OUT TO TEST THIS NEWLY RELEASED API
