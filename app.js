@@ -50,6 +50,8 @@
   const OCCUPANCY_HEAT_MAX_ABS_SCORE = 8;
   const DEFAULT_CONFIG = {
     apiKey: "",
+    apiMode: "proxy",
+    apiBase: "/api",
     refreshIntervalMs: DEFAULT_REFRESH_INTERVAL_MS,
     tileUrl: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     tileAttribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
@@ -190,7 +192,9 @@
       state.config = config;
       state.gtfs = gtfs;
       state.refreshIntervalMs = Math.max(30000, Number(config.refreshIntervalMs) || DEFAULT_REFRESH_INTERVAL_MS);
-      state.runtimeApiKey = config.apiKey || window.localStorage.getItem(STORAGE_KEYS.apiKey) || "";
+      state.runtimeApiKey = usesDirectApi()
+        ? config.apiKey || window.localStorage.getItem(STORAGE_KEYS.apiKey) || ""
+        : "";
       state.showOccupancyHeat = window.localStorage.getItem(STORAGE_KEYS.showHeat) !== "0";
       state.showBusBorders = window.localStorage.getItem(STORAGE_KEYS.showBusBorders) === "1";
       state.showRouteBorders = window.localStorage.getItem(STORAGE_KEYS.showRouteBorders) === "1";
@@ -209,7 +213,7 @@
         ensureTripStopsData().catch(() => { });
       }, 250);
 
-      if (state.runtimeApiKey) {
+      if (canUseLiveRestApi()) {
         startPolling(true);
       } else {
         showOverlay("Awaiting API key", "Set API_KEY in .env or enter it here.");
@@ -1408,7 +1412,7 @@
 
   function startPolling(immediate) {
     stopPolling();
-    if (!state.runtimeApiKey) {
+    if (!canUseLiveRestApi()) {
       return;
     }
     if (!state.vehicleMetaLoaded) {
@@ -1429,7 +1433,7 @@
   }
 
   async function refreshVehicles(manual) {
-    if (!state.runtimeApiKey) {
+    if (!canUseLiveRestApi()) {
       return;
     }
     if (document.visibilityState !== "visible" && !manual) {
@@ -1503,11 +1507,14 @@
   }
 
   async function fetchLive(path) {
-    const response = await fetch(`${API_BASE}${path}`, {
-      headers: {
-        Accept: "application/json",
-        "X-ApiKey": state.runtimeApiKey,
-      },
+    const headers = {
+      Accept: "application/json",
+    };
+    if (usesDirectApi() && state.runtimeApiKey) {
+      headers["X-ApiKey"] = state.runtimeApiKey;
+    }
+    const response = await fetch(`${resolveApiBase()}${path}`, {
+      headers,
     });
     const payload = await response.json().catch(() => ({}));
     const result = payload?.result ?? payload?.Result ?? payload;
@@ -2222,11 +2229,11 @@
       await ensureVehicleMetadata();
       const localDetail = deriveTripDetail(markerState.vehicle);
       const [trip, stop, departure] = await Promise.all([
-        state.runtimeApiKey ? fetchTripDetail(markerState.vehicle.tripId) : Promise.resolve(null),
-        state.runtimeApiKey && localDetail.nextStop?.stopId
+        canUseLiveRestApi() ? fetchTripDetail(markerState.vehicle.tripId) : Promise.resolve(null),
+        canUseLiveRestApi() && localDetail.nextStop?.stopId
           ? fetchStopDetail(localDetail.nextStop.stopId)
           : Promise.resolve(null),
-        state.runtimeApiKey && localDetail.nextStop?.stopId
+        canUseLiveRestApi() && localDetail.nextStop?.stopId
           ? fetchNextStopDeparture(markerState.vehicle, localDetail.nextStop.stopId).catch(() => null)
           : Promise.resolve(null),
       ]);
@@ -2355,7 +2362,7 @@
   }
 
   async function ensureVehicleMetadata() {
-    if (state.vehicleMetaLoaded || !state.runtimeApiKey) {
+    if (state.vehicleMetaLoaded || !canUseLiveRestApi()) {
       return;
     }
     const vehicles = await fetchLive("/vehicles");
@@ -5137,6 +5144,22 @@
     const [r, g, b] = hexToRgb(normalizeColor(backgroundColor));
     const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
     return luminance < 0.56 ? "#ffffff" : "#111111";
+  }
+
+  function usesDirectApi() {
+    return String(state.config?.apiMode || DEFAULT_CONFIG.apiMode).trim().toLowerCase() === "direct";
+  }
+
+  function canUseLiveRestApi() {
+    return usesDirectApi() ? Boolean(state.runtimeApiKey) : Boolean(resolveApiBase());
+  }
+
+  function resolveApiBase() {
+    const configured = String(state.config?.apiBase || "").trim();
+    if (configured) {
+      return configured.replace(/\/+$/, "");
+    }
+    return usesDirectApi() ? API_BASE : "/api";
   }
 
   function syncBusMarkerLabelRotation(element, angle) {

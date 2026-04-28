@@ -177,8 +177,12 @@ def normalize_color(value: str) -> str:
 
 def write_runtime_config() -> None:
     env = read_env_file(Path(".env"))
+    api_mode = (env.get("API_MODE", "proxy") or "proxy").strip().lower()
+    api_base = env.get("API_BASE", "/api").strip() or "/api"
     config = {
-        "apiKey": env.get("API_KEY", ""),
+        "apiKey": env.get("API_KEY", "") if api_mode == "direct" else "",
+        "apiMode": api_mode,
+        "apiBase": api_base,
         "refreshIntervalMs": int(env.get("REFRESH_INTERVAL_MS", "120000") or "120000"),
         "tileUrl": env.get("TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
         "tileAttribution": env.get(

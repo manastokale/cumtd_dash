@@ -25,6 +25,8 @@ jobs:
 
       - name: Generate runtime config
         env:
+          API_MODE: ${{ vars.API_MODE }}
+          API_BASE: ${{ vars.API_BASE }}
           API_KEY: ${{ secrets.API_KEY }}
           REFRESH_INTERVAL_MS: ${{ vars.REFRESH_INTERVAL_MS }}
           TILE_URL: ${{ vars.TILE_URL }}
@@ -42,8 +44,11 @@ jobs:
               raw = os.environ.get(name, "").strip()
               return raw or default
 
+          api_mode = value("API_MODE", "proxy").lower()
           config = {
-              "apiKey": value("API_KEY", ""),
+              "apiKey": value("API_KEY", "") if api_mode == "direct" else "",
+              "apiMode": api_mode,
+              "apiBase": value("API_BASE", "/api"),
               "refreshIntervalMs": int(value("REFRESH_INTERVAL_MS", "120000")),
               "tileUrl": value("TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
               "tileAttribution": value(
