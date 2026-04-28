@@ -9,6 +9,13 @@
   --glass-strong: rgba(231, 226, 215, 0.68);
   --glass-border: rgba(23, 23, 23, 0.16);
   --glass-shadow: 0 18px 60px rgba(20, 20, 20, 0.12);
+  --panel-surface: #0d0d0d;
+  --panel-text: #f3f0e7;
+  --panel-muted: #cbc5b9;
+  --panel-outline: #f3f0e7;
+  --panel-bg: rgba(10, 10, 10, 0.74);
+  --panel-strong: rgba(10, 10, 10, 0.84);
+  --panel-border: rgba(255, 255, 255, 0.14);
   --radius-lg: 28px;
   --radius-md: 20px;
   --radius-sm: 14px;
@@ -26,6 +33,13 @@ body[data-theme="dark"] {
   --glass-strong: rgba(12, 12, 12, 0.74);
   --glass-border: rgba(255, 255, 255, 0.12);
   --glass-shadow: 0 22px 72px rgba(0, 0, 0, 0.48);
+  --panel-surface: #f2efe5;
+  --panel-text: #141414;
+  --panel-muted: #5d5a52;
+  --panel-outline: #141414;
+  --panel-bg: rgba(242, 239, 229, 0.82);
+  --panel-strong: rgba(244, 241, 232, 0.9);
+  --panel-border: rgba(20, 20, 20, 0.12);
 }
 
 * {
@@ -124,6 +138,26 @@ body {
   box-shadow: var(--glass-shadow);
   backdrop-filter: blur(22px) saturate(1.08);
   -webkit-backdrop-filter: blur(22px) saturate(1.08);
+}
+
+.hud,
+.info-panel,
+.route-legend-panel,
+.key-panel,
+.overlay-card,
+.bus-panel-header,
+.bus-panel-meta-card,
+.bus-panel-spotlight,
+.bus-panel-grid,
+.bus-panel-upcoming {
+  color: var(--panel-text);
+  --text: var(--panel-text);
+  --muted: var(--panel-muted);
+  --outline: var(--panel-outline);
+  --surface: var(--panel-surface);
+  --glass-bg: var(--panel-bg);
+  --glass-strong: var(--panel-strong);
+  --glass-border: var(--panel-border);
 }
 
 .hud-left {
@@ -1186,9 +1220,12 @@ body {
   height: 10px;
   border-radius: 0;
   border: 0;
+  display: grid;
+  place-items: center;
   position: relative;
   will-change: transform;
   pointer-events: auto;
+  overflow: hidden;
 }
 
 .bus-shell {
@@ -1197,6 +1234,18 @@ body {
   will-change: transform;
   pointer-events: auto;
   cursor: pointer;
+}
+
+.bus-marker-label {
+  display: block;
+  font-size: 6px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  text-transform: uppercase;
+  pointer-events: none;
+  user-select: none;
+  opacity: 0;
 }
 
 .route-highlighted {

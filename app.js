@@ -17,6 +17,9 @@
   const ALL_STOPS_MIN_ZOOM = 14.8;
   const FOCUSED_ROUTE_STOPS_MIN_ZOOM = 17.2;
   const PLANNER_ROUTE_STOPS_MIN_ZOOM = 17.6;
+  const OVERVIEW_SIMPLIFY_TOLERANCE_METERS = 135;
+  const OVERVIEW_SMOOTHING_PASSES = 2;
+  const OVERVIEW_MIN_POINT_SPACING_METERS = 85;
   const ROUTE_BASE_SOURCE_ID = "routes-base";
   const ROUTE_FOCUS_SOURCE_ID = "routes-focus";
   const ROUTE_BASE_UNDERLAY_LAYER_ID = "routes-base-underlay";
@@ -71,6 +74,7 @@
     gtfsTripStopsLoading: null,
     map: null,
     routeTemplates: [],
+    routeOverviewTemplates: [],
     routeTemplatesByRouteId: new Map(),
     routeLegendEntries: [],
     routeStops: new Map(),
@@ -320,6 +324,7 @@
     const routeTemplatesByRouteId = new Map();
     const routeStops = new Map();
     const stopRouteIdsByStopId = new Map();
+    const routeOverviewMap = new Map();
     let minLat = Infinity;
     let maxLat = -Infinity;
     let minLon = Infinity;
@@ -362,6 +367,7 @@
           routeLongName: route.longName || "",
           routeColor: route.color || "#d9d1c3",
           baseWidth: width,
+          pathLength: pathLengthMeters(coordinates),
         },
         geometry: {
           type: "LineString",
@@ -369,6 +375,25 @@
         },
       };
       routeTemplates.push(template);
+      const routeKey = String(route.shortName || route.gtfsRouteId || "").trim() || String(route.gtfsRouteId || "").trim();
+      const overviewCoordinates = stylizeOverviewCoordinates(coordinates);
+      const overviewCandidate = {
+        ...template,
+        id: `overview-${featureId}`,
+        properties: {
+          ...template.properties,
+          routeKey,
+          overviewOverlapCoordinates: coordinates,
+        },
+        geometry: {
+          type: "LineString",
+          coordinates: overviewCoordinates,
+        },
+      };
+      const existingOverview = routeOverviewMap.get(routeKey);
+      if (!existingOverview || overviewTemplateScore(overviewCandidate) > overviewTemplateScore(existingOverview)) {
+        routeOverviewMap.set(routeKey, overviewCandidate);
+      }
       if (!routeTemplatesByRouteId.has(routeId)) {
         routeTemplatesByRouteId.set(routeId, []);
       }
@@ -395,7 +420,9 @@
       throw new Error("GTFS shape cache is empty.");
     }
 
+    const overviewTemplatesWithOffsets = assignOverviewOffsets([...routeOverviewMap.values()]);
     state.routeTemplates = routeTemplates;
+    state.routeOverviewTemplates = overviewTemplatesWithOffsets;
     state.routeTemplatesByRouteId = routeTemplatesByRouteId;
     state.routeStops = new Map(
       [...routeStops.entries()].map(([routeId, stops]) => [routeId, [...stops.values()]])
@@ -414,6 +441,257 @@
       [minLon, minLat],
       [maxLon, maxLat],
     ];
+  }
+
+  function assignOverviewOffsets(templates) {
+    const normalized = templates.map((template) => ({
+      ...template,
+      properties: {
+        ...template.properties,
+        lineOffset: 0,
+      },
+    }));
+    const segmentOwners = new Map();
+    const segmentsById = new Map();
+
+    for (const template of normalized) {
+      const segmentKeys = routeSegmentKeys(template.properties?.overviewOverlapCoordinates || template.geometry?.coordinates || []);
+      segmentsById.set(template.id, segmentKeys);
+      for (const key of segmentKeys) {
+        if (!segmentOwners.has(key)) {
+          segmentOwners.set(key, []);
+        }
+        segmentOwners.get(key).push(template.id);
+      }
+    }
+
+    const adjacency = new Map(normalized.map((template) => [template.id, new Set()]));
+    const overlapCounts = new Map();
+
+    for (const owners of segmentOwners.values()) {
+      if (owners.length < 2) {
+        continue;
+      }
+      for (let index = 0; index < owners.length; index += 1) {
+        for (let otherIndex = index + 1; otherIndex < owners.length; otherIndex += 1) {
+          const left = owners[index];
+          const right = owners[otherIndex];
+          const pairKey = left < right ? `${left}::${right}` : `${right}::${left}`;
+          overlapCounts.set(pairKey, (overlapCounts.get(pairKey) || 0) + 1);
+        }
+      }
+    }
+
+    for (const [pairKey, overlap] of overlapCounts.entries()) {
+      const [left, right] = pairKey.split("::");
+      const leftSegments = segmentsById.get(left)?.length || 0;
+      const rightSegments = segmentsById.get(right)?.length || 0;
+      const ratio = overlap / Math.max(1, Math.min(leftSegments, rightSegments));
+      if (overlap < 2 || ratio < 0.08) {
+        continue;
+      }
+      adjacency.get(left)?.add(right);
+      adjacency.get(right)?.add(left);
+    }
+
+    const byId = new Map(normalized.map((template) => [template.id, template]));
+    const seen = new Set();
+
+    for (const template of normalized) {
+      if (seen.has(template.id)) {
+        continue;
+      }
+      const stack = [template.id];
+      const component = [];
+      while (stack.length) {
+        const current = stack.pop();
+        if (!current || seen.has(current)) {
+          continue;
+        }
+        seen.add(current);
+        component.push(current);
+        for (const neighbor of adjacency.get(current) || []) {
+          if (!seen.has(neighbor)) {
+            stack.push(neighbor);
+          }
+        }
+      }
+
+      if (component.length < 2) {
+        continue;
+      }
+
+      const ordered = component
+        .map((id) => byId.get(id))
+        .filter(Boolean)
+        .sort((left, right) => {
+          const leftKey = `${left.properties.routeShortName || left.properties.routeLongName || left.properties.routeId}`;
+          const rightKey = `${right.properties.routeShortName || right.properties.routeLongName || right.properties.routeId}`;
+          return leftKey.localeCompare(rightKey, undefined, { numeric: true, sensitivity: "base" });
+        });
+
+      const offsets = symmetricOffsets(ordered.length, 2.3);
+      ordered.forEach((item, index) => {
+        item.properties.lineOffset = offsets[index];
+      });
+    }
+
+    return normalized;
+  }
+
+  function routeSegmentKeys(coordinates) {
+    const keys = [];
+    const step = coordinates.length > 90 ? 4 : coordinates.length > 44 ? 3 : 2;
+    for (let index = 0; index < coordinates.length - 1; index += step) {
+      const start = coordinates[index];
+      const end = coordinates[Math.min(index + step, coordinates.length - 1)];
+      if (!Array.isArray(start) || !Array.isArray(end)) {
+        continue;
+      }
+      const key = normalizedSegmentKey(start, end);
+      if (key) {
+        keys.push(key);
+      }
+    }
+    return [...new Set(keys)];
+  }
+
+  function normalizedSegmentKey(start, end) {
+    const a = `${Number(start[0]).toFixed(3)},${Number(start[1]).toFixed(3)}`;
+    const b = `${Number(end[0]).toFixed(3)},${Number(end[1]).toFixed(3)}`;
+    if (!a || !b || a === b) {
+      return "";
+    }
+    return a < b ? `${a}|${b}` : `${b}|${a}`;
+  }
+
+  function symmetricOffsets(count, spacing) {
+    if (count <= 1) {
+      return [0];
+    }
+    const center = (count - 1) / 2;
+    return Array.from({ length: count }, (_, index) => Number(((index - center) * spacing).toFixed(2)));
+  }
+
+  function overviewTemplateScore(template) {
+    const routeShortName = String(template?.properties?.routeShortName || "");
+    const pathLength = Number(template?.properties?.pathLength || 0);
+    const coordinateCount = Array.isArray(template?.geometry?.coordinates) ? template.geometry.coordinates.length : 0;
+    const expressBias = /airbus|silver|express/i.test(routeShortName) ? 0.96 : 1;
+    return pathLength * expressBias + coordinateCount * 28;
+  }
+
+  function pathLengthMeters(coordinates) {
+    let total = 0;
+    for (let index = 1; index < coordinates.length; index += 1) {
+      const prev = coordinates[index - 1];
+      const current = coordinates[index];
+      total += haversineMeters(prev[1], prev[0], current[1], current[0]);
+    }
+    return total;
+  }
+
+  function stylizeOverviewCoordinates(coordinates) {
+    const simplified = simplifyOverviewPolyline(coordinates, OVERVIEW_SIMPLIFY_TOLERANCE_METERS);
+    const smoothed = chaikinSmoothPolyline(simplified, OVERVIEW_SMOOTHING_PASSES);
+    const thinned = thinPolylineByDistance(smoothed, OVERVIEW_MIN_POINT_SPACING_METERS);
+    return thinned.length >= 2 ? thinned : coordinates;
+  }
+
+  function simplifyOverviewPolyline(coordinates, toleranceMeters) {
+    if (!Array.isArray(coordinates) || coordinates.length <= 2) {
+      return coordinates;
+    }
+    const keep = new Array(coordinates.length).fill(false);
+    keep[0] = true;
+    keep[coordinates.length - 1] = true;
+    simplifyOverviewSegment(coordinates, 0, coordinates.length - 1, toleranceMeters * toleranceMeters, keep);
+    return coordinates.filter((_, index) => keep[index]);
+  }
+
+  function simplifyOverviewSegment(coordinates, startIndex, endIndex, toleranceSq, keep) {
+    if (endIndex - startIndex <= 1) {
+      return;
+    }
+    let maxDistanceSq = 0;
+    let maxIndex = -1;
+    const start = coordinates[startIndex];
+    const end = coordinates[endIndex];
+    for (let index = startIndex + 1; index < endIndex; index += 1) {
+      const distanceSq = perpendicularDistanceSqMeters(coordinates[index], start, end);
+      if (distanceSq > maxDistanceSq) {
+        maxDistanceSq = distanceSq;
+        maxIndex = index;
+      }
+    }
+    if (maxIndex !== -1 && maxDistanceSq > toleranceSq) {
+      keep[maxIndex] = true;
+      simplifyOverviewSegment(coordinates, startIndex, maxIndex, toleranceSq, keep);
+      simplifyOverviewSegment(coordinates, maxIndex, endIndex, toleranceSq, keep);
+    }
+  }
+
+  function perpendicularDistanceSqMeters(point, start, end) {
+    const refLat = (((point[1] + start[1] + end[1]) / 3) * Math.PI) / 180;
+    const scaleX = 111320 * Math.cos(refLat);
+    const scaleY = 110540;
+    const sx = start[0] * scaleX;
+    const sy = start[1] * scaleY;
+    const ex = end[0] * scaleX;
+    const ey = end[1] * scaleY;
+    const px = point[0] * scaleX;
+    const py = point[1] * scaleY;
+    const dx = ex - sx;
+    const dy = ey - sy;
+    if (Math.abs(dx) < 0.00001 && Math.abs(dy) < 0.00001) {
+      const qx = px - sx;
+      const qy = py - sy;
+      return qx * qx + qy * qy;
+    }
+    const t = clamp(((px - sx) * dx + (py - sy) * dy) / (dx * dx + dy * dy), 0, 1);
+    const projX = sx + t * dx;
+    const projY = sy + t * dy;
+    const distX = px - projX;
+    const distY = py - projY;
+    return distX * distX + distY * distY;
+  }
+
+  function chaikinSmoothPolyline(coordinates, passes) {
+    let current = Array.isArray(coordinates) ? coordinates.slice() : [];
+    for (let pass = 0; pass < passes; pass += 1) {
+      if (current.length <= 2) {
+        return current;
+      }
+      const next = [current[0]];
+      for (let index = 0; index < current.length - 1; index += 1) {
+        const start = current[index];
+        const end = current[index + 1];
+        const q = [lerp(start[0], end[0], 0.25), lerp(start[1], end[1], 0.25)];
+        const r = [lerp(start[0], end[0], 0.75), lerp(start[1], end[1], 0.75)];
+        next.push(q, r);
+      }
+      next.push(current[current.length - 1]);
+      current = next;
+    }
+    return current;
+  }
+
+  function thinPolylineByDistance(coordinates, minDistanceMeters) {
+    if (!Array.isArray(coordinates) || coordinates.length <= 2) {
+      return coordinates;
+    }
+    const thinned = [coordinates[0]];
+    let anchor = coordinates[0];
+    for (let index = 1; index < coordinates.length - 1; index += 1) {
+      const point = coordinates[index];
+      const distance = haversineMeters(anchor[1], anchor[0], point[1], point[0]);
+      if (distance >= minDistanceMeters) {
+        thinned.push(point);
+        anchor = point;
+      }
+    }
+    thinned.push(coordinates[coordinates.length - 1]);
+    return dedupeConsecutiveCoordinates(thinned);
   }
 
   function renderRouteLegend() {
@@ -692,6 +970,7 @@
       paint: {
         "line-color": "#111111",
         "line-width": ["coalesce", ["get", "outlineWidth"], 3.8],
+        "line-offset": ["coalesce", ["get", "lineOffset"], 0],
         "line-opacity": ["coalesce", ["get", "outlineOpacity"], 0],
       },
     });
@@ -705,6 +984,7 @@
       },
       paint: {
         "line-color": ["coalesce", ["get", "routeColor"], "#d9d1c3"],
+        "line-offset": ["coalesce", ["get", "lineOffset"], 0],
         "line-width": [
           "interpolate",
           ["linear"],
@@ -746,6 +1026,7 @@
       paint: {
         "line-color": "#111111",
         "line-width": ["coalesce", ["get", "outlineWidth"], 4.8],
+        "line-offset": ["coalesce", ["get", "lineOffset"], 0],
         "line-opacity": ["coalesce", ["get", "outlineOpacity"], 0],
       },
     });
@@ -759,6 +1040,7 @@
       },
       paint: {
         "line-color": ["coalesce", ["get", "routeColor"], "#d9d1c3"],
+        "line-offset": ["coalesce", ["get", "lineOffset"], 0],
         "line-width": [
           "interpolate",
           ["linear"],
@@ -941,7 +1223,9 @@
       return;
     }
 
-    for (const template of state.routeTemplates) {
+    const templates = state.routeTemplates;
+
+    for (const template of templates) {
       const routeId = template.properties.routeId;
       const baseWidth = template.properties.baseWidth;
 
@@ -949,6 +1233,7 @@
         baseFeatures.push(cloneFeature(template, {
           lineWidth: baseWidth,
           outlineWidth: baseWidth + 2.2,
+          lineOffset: template.properties.lineOffset || 0,
           lineOpacity: darkMode ? 0.66 : 0.96,
           outlineOpacity: state.showRouteBorders ? (darkMode ? 0.78 : 1) : 0,
         }));
@@ -959,6 +1244,7 @@
         focusFeatures.push(cloneFeature(template, {
           lineWidth: baseWidth + 0.45,
           outlineWidth: baseWidth + 2.8,
+          lineOffset: 0,
           lineOpacity: darkMode ? 0.8 : 1,
           outlineOpacity: state.showRouteBorders ? (darkMode ? 0.84 : 1) : 0,
         }));
@@ -966,6 +1252,7 @@
         baseFeatures.push(cloneFeature(template, {
           lineWidth: Math.max(1.8, baseWidth - 0.15),
           outlineWidth: Math.max(3.4, baseWidth + 1.9),
+          lineOffset: 0,
           lineOpacity: plannerIsolation
             ? 0
             : state.selectedBusId || state.selectedStopId || state.selectedRouteId || state.selectedRouteLegendKey
@@ -1685,7 +1972,11 @@
   function createBusMarker(vehicle) {
     const element = document.createElement("div");
     element.className = "bus-shell";
-    element.innerHTML = `<div class="bus-marker" style="background:${escapeAttr(vehicle.route.color)}"></div>`;
+    const label = String(vehicle.route?.shortName || vehicle.id || "").trim();
+    const labelColor = busMarkerLabelColor(vehicle.route?.color, vehicle.route?.textColor);
+    element.innerHTML = `<div class="bus-marker" style="background:${escapeAttr(vehicle.route.color)};color:${escapeAttr(
+      labelColor
+    )}"><span class="bus-marker-label">${escapeHtml(label)}</span></div>`;
     element.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -1704,6 +1995,8 @@
     if (typeof marker.setSubpixelPositioning === "function") {
       marker.setSubpixelPositioning(true);
     }
+
+    syncBusMarkerLabelRotation(element, inferVehicleAngle(vehicle, null));
 
     return marker;
   }
@@ -1725,6 +2018,7 @@
         markerState.currentProgress = animated.progress;
         markerState.marker.setLngLat(animated.location);
         markerState.marker.setRotation(animated.angle);
+        syncBusMarkerLabelRotation(markerState.marker.getElement(), animated.angle);
       }
 
       if (progress < 1) {
@@ -1840,6 +2134,7 @@
       element.style.zIndex = busSelected ? "860" : opacity > 0.2 ? "800" : "420";
       const shell = element;
       const marker = element.querySelector(".bus-marker");
+      const label = element.querySelector(".bus-marker-label");
       if (shell && marker) {
         const selectedScale = busSelected ? 1.18 : 1;
         const width = 18 * zoomScale * selectedScale;
@@ -1851,6 +2146,14 @@
         marker.style.height = `${height.toFixed(2)}px`;
         marker.style.boxSizing = "border-box";
         marker.style.border = state.showBusBorders ? "3.2px solid #111111" : "0";
+        if (label) {
+          const labelScale = clamp((zoomScale - 1) / 1.2, 0, 1);
+          const fontSize = Math.max(6, Math.min(width * 0.5, height * 0.9));
+          label.style.fontSize = `${fontSize.toFixed(2)}px`;
+          label.style.opacity = labelScale > 0.08 ? String(labelScale) : "0";
+          label.style.letterSpacing = `${Math.max(0, Math.min(0.5, fontSize * 0.02)).toFixed(2)}px`;
+        }
+        syncBusMarkerLabelRotation(element, markerState.angle);
       }
     }
   }
@@ -4824,6 +5127,25 @@
       Number.parseInt(value.slice(2, 4), 16),
       Number.parseInt(value.slice(4, 6), 16),
     ].map((channel) => (Number.isFinite(channel) ? channel : 217));
+  }
+
+  function busMarkerLabelColor(backgroundColor, preferredTextColor) {
+    const preferred = normalizeColor(preferredTextColor);
+    if (preferred) {
+      return preferred;
+    }
+    const [r, g, b] = hexToRgb(normalizeColor(backgroundColor));
+    const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    return luminance < 0.56 ? "#ffffff" : "#111111";
+  }
+
+  function syncBusMarkerLabelRotation(element, angle) {
+    const label = element?.querySelector?.(".bus-marker-label");
+    if (!label) {
+      return;
+    }
+    const value = Number.isFinite(angle) ? angle : 0;
+    label.style.transform = `rotate(${(-value).toFixed(2)}deg)`;
   }
 
   function snapLocationToShape(location, shapeId) {
